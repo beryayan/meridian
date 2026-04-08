@@ -21,6 +21,7 @@ import {
 import { recordPerformance } from "../lessons.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { normalizeMint } from "./wallet.js";
+import { appendDecision } from "../decision-log.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 let _DLMM = null;
@@ -991,6 +992,26 @@ export async function closePosition({ position_address, reason }) {
         close_reason: reason || "agent decision",
       });
 
+      appendDecision({
+        type: "close",
+        actor: "MANAGER",
+        pool: poolAddress,
+        pool_name: tracked.pool_name || poolMeta.name || poolAddress.slice(0, 8),
+        position: position_address,
+        summary: `Closed at ${pnlPct.toFixed(2)}%`,
+        reason: reason || "agent decision",
+        risks: [
+          minutesOOR > 0 ? `out of range ${minutesOOR}m` : null,
+          tracked.volatility != null ? `volatility ${tracked.volatility}` : null,
+        ].filter(Boolean),
+        metrics: {
+          pnl_usd: pnlUsd,
+          pnl_pct: pnlPct,
+          fees_usd: feesUsd,
+          minutes_held: minutesHeld,
+        },
+      });
+
       return {
         success: true,
         position: position_address,
@@ -1011,6 +1032,17 @@ export async function closePosition({ position_address, reason }) {
         close_reason: reason || "agent decision",
       };
     }
+
+    appendDecision({
+      type: "close",
+      actor: "MANAGER",
+      pool: poolAddress,
+      pool_name: poolMeta.name || poolAddress.slice(0, 8),
+      position: position_address,
+      summary: "Closed position",
+      reason: reason || "agent decision",
+      metrics: {},
+    });
 
     return {
       success: true,
