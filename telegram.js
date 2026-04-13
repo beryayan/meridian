@@ -408,13 +408,52 @@ export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, 
   );
 }
 
-export async function notifyClose({ pair, pnlUsd, pnlPct }) {
+export async function notifyClose({
+  pair,
+  pnlUsd,
+  pnlPct,
+  feesEarnedUsd,
+  minutesHeld,
+  minutesInRange,
+  initialValueUsd,
+  finalValueUsd,
+  amountSol,
+  closeReason,
+  poolAddress,
+}) {
   if (hasActiveLiveMessage()) return;
+
   const sign = pnlUsd >= 0 ? "+" : "";
+  const emoji = pnlUsd >= 0 ? "🟢" : "🔴";
+  const inRangePct = minutesHeld > 0
+    ? Math.min(100, Math.round((minutesInRange / minutesHeld) * 100))
+    : 0;
+  const progressBar = buildProgressBar(inRangePct);
+  const hours = Math.floor(minutesHeld / 60);
+  const mins = minutesHeld % 60;
+  const timeStr = hours > 0 ? `${hours}h ${mins}m` : `${mins}m`;
+
+  const reasonLine = closeReason
+    ? `\n──────────────────\n${closeReason}\n──────────────────`
+    : "";
+
   await sendHTML(
-    `🔒 <b>Closed</b> ${pair}\n` +
-    `PnL: ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`
+    `${emoji} <b>CLOSED</b> — ${pair}` +
+    `${reasonLine}` +
+    `\n\n💵 PnL: ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)` +
+    `\n💎 Fees earned: ${sign}$${(feesEarnedUsd ?? 0).toFixed(2)}` +
+    `\n⏱ ${timeStr}  │  ${(amountSol ?? 0).toFixed(3)} SOL deployed` +
+    `\n💰 ${(initialValueUsd ?? 0).toFixed(2)} → ${(finalValueUsd ?? 0).toFixed(2)}` +
+    `\n📐 In-range: ${inRangePct}% ${progressBar}` +
+    (poolAddress ? `\n🔑 ${String(poolAddress).slice(0, 16)}…` : "")
   );
+}
+
+function buildProgressBar(pct) {
+  const total = 20;
+  const filled = Math.round((Math.min(100, pct) / 100) * total);
+  const empty = total - filled;
+  return "█".repeat(filled) + "░".repeat(empty);
 }
 
 export async function notifySwap({ inputSymbol, outputSymbol, amountIn, amountOut, tx }) {

@@ -202,7 +202,7 @@ export function recordRebalance(old_position, new_position) {
   }
   const newPos = state.positions[new_position];
   if (newPos) {
-    newPos.rebalance_count = (old?.rebalance_count || 0) + 1;
+    newPos.rebalance_count = (old && old.rebalance_count ? old.rebalance_count : 0) + 1;
     newPos.notes.push(`Rebalanced from ${old_position}`);
   }
   save(state);
@@ -515,6 +515,7 @@ export function syncOpenPositions(active_addresses) {
     pos.closed = true;
     pos.closed_at = new Date().toISOString();
     pos.notes.push(`Auto-closed during state sync (not found on-chain)`);
+    pushEvent(state, { action: "close", position: posId, pool_name: pos.pool_name || pos.pool, reason: "auto-sync" });
     changed = true;
     log("state", `Position ${posId} auto-closed (missing from on-chain data)`);
   }

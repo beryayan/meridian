@@ -131,7 +131,7 @@ function buildOwnerSnapshots(rows, ownerSignals, signalPositions, overview, pool
     const maxPrice = num(row.range?.maxPrice);
     const lowerBinId = row.range?.lowerBinId ?? signalPosition?.lowerBinId ?? null;
     const upperBinId = row.range?.upperBinId ?? signalPosition?.upperBinId ?? null;
-    const activeBinId = row.poolActiveBinId ?? poolDataActiveBinIdFallback(signalPosition, signal) ?? null;
+    const activeBinId = row.poolActiveBinId ?? overview.poolActiveBinId ?? null;
     const rangeWidthPct =
       calcRangeWidthPctFromBins(lowerBinId, upperBinId, overview.binStep) ??
       (minPrice > 0 && maxPrice > 0 ? ((maxPrice - minPrice) / minPrice) * 100 : null);
@@ -220,9 +220,10 @@ function buildPatterns(ranked, signalData, overview) {
     avg_fee_per_tvl_24h_pct: avgFeePerTvl,
     avg_range_width_pct: avgWidth,
     avg_distance_to_active_pct: avgDistance,
-    best_open_pnl_pct: maxOf(ranked.map((o) => o.summary.avg_open_pnl_pct)) != null
-      ? `${round(maxOf(ranked.map((o) => o.summary.avg_open_pnl_pct)), 2)}%`
-      : null,
+    best_open_pnl_pct: (() => {
+      const best = maxOf(ranked.map((o) => o.summary.avg_open_pnl_pct));
+      return best != null ? `${round(best, 2)}%` : null;
+    })(),
     scalper_count: ranked.filter((o) => o.summary.avg_hold_hours < 1).length,
     holder_count: ranked.filter((o) => o.summary.avg_hold_hours >= 4).length,
     mature_winner_count: (signalData.matureWinners?.positions || []).length,
@@ -330,10 +331,6 @@ function calcDistanceToActivePctFromBins(activeBinId, lowerBinId, upperBinId, bi
   if (!Number.isFinite(active) || !Number.isFinite(low) || !Number.isFinite(high)) return null;
 
   return calcDistanceToActivePct(active, low, high);
-}
-
-function poolDataActiveBinIdFallback(signalPosition, signal) {
-  return signalPosition?.activeBinId ?? signal?.samples?.[0]?.activeBinId ?? null;
 }
 
 function toHours(iso) {

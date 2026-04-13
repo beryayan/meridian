@@ -1002,6 +1002,13 @@ export async function closePosition({ position_address, reason }) {
         pnl_usd: pnlUsd,
         pnl_pct: pnlPct,
         base_mint: pool.lbPair.tokenXMint.toString(),
+        fees_earned_usd: feesUsd,
+        minutes_held: minutesHeld,
+        minutes_in_range: minutesHeld - minutesOOR,
+        initial_value_usd: initialUsd,
+        final_value_usd: finalValueUsd,
+        amount_sol: tracked.amount_sol || null,
+        close_reason: reason || "agent decision",
       };
     }
 
