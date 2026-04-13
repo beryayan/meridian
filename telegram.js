@@ -18,6 +18,7 @@ const ALLOWED_USER_IDS = new Set(
 let chatId   = process.env.TELEGRAM_CHAT_ID || null;
 let _offset  = 0;
 let _polling = false;
+let _lastPollAt = Date.now();
 let _liveMessageDepth = 0;
 let _warnedMissingChatId = false;
 let _warnedMissingAllowedUsers = false;
@@ -38,7 +39,9 @@ function saveChatId(id) {
       ? JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"))
       : {};
     cfg.telegramChatId = id;
-    fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(cfg, null, 2));
+    const tmp = USER_CONFIG_PATH + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2));
+    fs.renameSync(tmp, USER_CONFIG_PATH); // atomic on all OS
   } catch (e) {
     log("telegram_error", `Failed to persist chatId: ${e.message}`);
   }
@@ -81,24 +84,37 @@ export function isEnabled() {
   return !!TOKEN;
 }
 
-async function postTelegram(method, body) {
+async function postTelegram(method, body, retries = 3) {
   if (!TOKEN || !chatId) return null;
-  try {
-    const res = await fetch(`${BASE}/${method}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, ...body }),
-    });
-    if (!res.ok) {
-      const err = await res.text();
-      log("telegram_error", `${method} ${res.status}: ${err.slice(0, 200)}`);
-      return null;
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      const res = await fetch(`${BASE}/${method}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId, ...body }),
+      });
+      if (res.status === 429) {
+        const data = await res.json().catch(() => ({}));
+        const waitSec = data?.parameters?.retry_after ?? 5;
+        log("telegram_warn", `Rate limited — waiting ${waitSec}s`);
+        await sleep(waitSec * 1000);
+        continue; // retry
+      }
+      if (!res.ok) {
+        const err = await res.text();
+        // "message is not modified" is not a real error — Telegram returns it when content is identical
+        if (!err.includes("message is not modified")) {
+          log("telegram_error", `${method} ${res.status}: ${err.slice(0, 200)}`);
+        }
+        return null;
+      }
+      return await res.json();
+    } catch (e) {
+      log("telegram_error", `${method} failed: ${e.message}`);
+      if (attempt < retries - 1) await sleep(2000);
     }
-    return await res.json();
-  } catch (e) {
-    log("telegram_error", `${method} failed: ${e.message}`);
-    return null;
   }
+  return null;
 }
 
 export async function sendMessage(text) {
@@ -215,6 +231,7 @@ export async function createLiveMessage(title, intro = "Starting...") {
     flushPromise: null,
     flushRequested: false,
   };
+  let _flushing = false;
 
   function render() {
     const sections = [state.title];
@@ -225,15 +242,22 @@ export async function createLiveMessage(title, intro = "Starting...") {
   }
 
   async function flushNow() {
+    if (_flushing) return;
+    _flushing = true;
     state.flushTimer = null;
     state.flushRequested = false;
-    const text = render();
-    if (!state.messageId) {
-      const sent = await sendMessage(text);
-      state.messageId = sent?.result?.message_id ?? null;
-      return;
+    try {
+      const text = render();
+      if (!state.messageId) {
+        const sent = await sendMessage(text);
+        state.messageId = sent?.result?.message_id ?? null;
+        return;
+      }
+      await editMessage(text, state.messageId);
+    } finally {
+      _flushing = false;
+      if (state.flushRequested) scheduleFlush(100);
     }
-    await editMessage(text, state.messageId);
   }
 
   function scheduleFlush(delay = 300) {
@@ -256,7 +280,23 @@ export async function createLiveMessage(title, intro = "Starting...") {
   }
 
   _liveMessageDepth += 1;
-  await flushNow();
+  try {
+    await flushNow();
+  } catch (e) {
+    _liveMessageDepth = Math.max(0, _liveMessageDepth - 1);
+    typing.stop();
+    log("telegram_error", `createLiveMessage initial flush failed: ${e.message}`);
+    return null;
+  }
+
+  // Safety timeout — auto-cleanup if finalize/fail is never called
+  const safetyTimeout = setTimeout(() => {
+    if (_liveMessageDepth > 0) {
+      log("telegram_warn", "Live message depth leak — force resetting");
+      _liveMessageDepth = Math.max(0, _liveMessageDepth - 1);
+      typing.stop();
+    }
+  }, 5 * 60 * 1000);
 
   return {
     async toolStart(name) {
@@ -272,6 +312,7 @@ export async function createLiveMessage(title, intro = "Starting...") {
       scheduleFlush();
     },
     async finalize(finalText) {
+      clearTimeout(safetyTimeout);
       if (state.flushTimer) {
         clearTimeout(state.flushTimer);
         state.flushTimer = null;
@@ -283,6 +324,7 @@ export async function createLiveMessage(title, intro = "Starting...") {
       typing.stop();
     },
     async fail(errorText) {
+      clearTimeout(safetyTimeout);
       if (state.flushTimer) {
         clearTimeout(state.flushTimer);
         state.flushTimer = null;
@@ -307,6 +349,7 @@ async function poll(onMessage) {
       );
       if (!res.ok) { await sleep(5000); continue; }
       const data = await res.json();
+      _lastPollAt = Date.now();
       for (const update of data.result || []) {
         _offset = update.update_id + 1;
         const msg = update.message;
@@ -327,6 +370,14 @@ export function startPolling(onMessage) {
   if (!TOKEN) return;
   _polling = true;
   poll(onMessage); // fire-and-forget
+  const pollWatchdog = setInterval(() => {
+    if (!_polling) { clearInterval(pollWatchdog); return; }
+    if (Date.now() - _lastPollAt > 60_000) {
+      log("telegram_warn", "Poll watchdog: no updates in 60s — restarting poll");
+      _lastPollAt = Date.now();
+      poll(onMessage).catch(() => null);
+    }
+  }, 30_000);
   log("telegram", "Bot polling started");
 }
 

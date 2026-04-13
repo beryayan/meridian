@@ -27,9 +27,6 @@ ensureAgentId();
 bootstrapHiveMind().catch((error) => log("hivemind_warn", `Bootstrap failed: ${error.message}`));
 startHiveMindBackgroundSync();
 
-const TP_PCT = config.management.takeProfitPct;
-const DEPLOY = config.management.deployAmountSol;
-
 // ═══════════════════════════════════════════
 //  CYCLE TIMERS
 // ═══════════════════════════════════════════
@@ -66,6 +63,8 @@ let _screeningBusy = false;  // prevents overlapping screening cycles
 let _screeningLastTriggered = 0; // epoch ms — prevents management from spamming screening
 let _pollTriggeredAt = 0; // epoch ms — cooldown for poller-triggered management
 const _peakConfirmTimers = new Map();
+let _pnlPollInterval = null;
+let _promptRefreshInterval = null;
 const _trailingDropConfirmTimers = new Map();
 const TRAILING_PEAK_CONFIRM_DELAY_MS = 15_000;
 const TRAILING_PEAK_CONFIRM_TOLERANCE = 0.85;
@@ -166,7 +165,7 @@ async function maybeRunMissedBriefing() {
 
 function stopCronJobs() {
   for (const task of _cronTasks) task.stop();
-  if (_cronTasks._pnlPollInterval) clearInterval(_cronTasks._pnlPollInterval);
+  if (_pnlPollInterval) { clearInterval(_pnlPollInterval); _pnlPollInterval = null; }
   _cronTasks = [];
 }
 
@@ -622,17 +621,16 @@ export function startCronJobs() {
 
   const mgmtTask = cron.schedule(`*/${Math.max(1, config.schedule.managementIntervalMin)} * * * *`, async () => {
     if (_managementBusy) return;
-    timers.managementLastRun = Date.now();
-    await runManagementCycle();
+    await runManagementCycle(); // timer sudah diset di dalam runManagementCycle
   });
 
   const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, runScreeningCycle);
 
   const healthTask = cron.schedule(`0 * * * *`, async () => {
     if (_managementBusy) return;
-    _managementBusy = true;
-    log("cron", "Starting health check");
     try {
+      _managementBusy = true;
+      log("cron", "Starting health check");
       await agentLoop(`
 HEALTH CHECK
 
@@ -707,7 +705,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
 
   _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask, briefingWatchdog];
   // Store interval ref so stopCronJobs can clear it
-  _cronTasks._pnlPollInterval = pnlPollInterval;
+  _pnlPollInterval = pnlPollInterval;
   log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m`);
 }
 
@@ -717,6 +715,16 @@ Summarize the current portfolio health, total fees earned, and performance of al
 async function shutdown(signal) {
   log("shutdown", `Received ${signal}. Shutting down...`);
   stopPolling();
+  stopCronJobs();
+  if (_promptRefreshInterval) { clearInterval(_promptRefreshInterval); _promptRefreshInterval = null; }
+  // Wait for any active cycle to finish before exiting
+  if (_managementBusy || _screeningBusy) {
+    log("shutdown", "Waiting for active cycle to finish (max 30s)...");
+    const deadline = Date.now() + 30_000;
+    while ((_managementBusy || _screeningBusy) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
   const positions = await getMyPositions();
   log("shutdown", `Open positions at shutdown: ${positions.total_positions}`);
   process.exit(0);
@@ -962,7 +970,11 @@ function refreshPrompt() {
 async function drainTelegramQueue() {
   while (_telegramQueue.length > 0 && !_managementBusy && !_screeningBusy && !busy) {
     const queued = _telegramQueue.shift();
-    await telegramHandler(queued);
+    try {
+      await telegramHandler(queued);
+    } catch (e) {
+      log("telegram_error", `Queue drain error: ${e.message}`);
+    }
   }
 }
 
@@ -1257,7 +1269,7 @@ if (isTTY) {
   _ttyInterface = rl;
 
   // Update prompt countdown every 10 seconds
-  setInterval(() => {
+  _promptRefreshInterval = setInterval(() => {
     if (!busy) {
       rl.setPrompt(buildPrompt());
       rl.prompt(true); // true = preserve current line
@@ -1333,7 +1345,7 @@ if (isTTY) {
 
   console.log(`
 Commands:
-  1 / 2 / 3 ...  Deploy ${DEPLOY} SOL into that pool
+  1 / 2 / 3 ...  Deploy ${config.management.deployAmountSol} SOL into that pool
   auto           Let the agent pick and deploy automatically
   /status        Refresh wallet + positions
   /candidates    Refresh top pool list
@@ -1357,9 +1369,9 @@ Commands:
     if (!isNaN(pick) && pick >= 1 && pick <= latest.length) {
       await runBusy(async () => {
         const pool = latest[pick - 1];
-        console.log(`\nDeploying ${DEPLOY} SOL into ${pool.name}...\n`);
+        console.log(`\nDeploying ${config.management.deployAmountSol} SOL into ${pool.name}...\n`);
         const { content: reply } = await agentLoop(
-          `Deploy ${DEPLOY} SOL into pool ${pool.pool} (${pool.name}). Call get_active_bin first then deploy_position. Report result.`,
+          `Deploy ${config.management.deployAmountSol} SOL into pool ${pool.pool} (${pool.name}). Call get_active_bin first then deploy_position. Report result.`,
           config.llm.maxSteps,
           [],
           "SCREENER"
@@ -1375,7 +1387,7 @@ Commands:
       await runBusy(async () => {
         console.log("\nAgent is picking and deploying...\n");
         const { content: reply } = await agentLoop(
-          `get_top_candidates, pick the best one, get_active_bin, deploy_position with ${DEPLOY} SOL. Execute now, don't ask.`,
+          `get_top_candidates, pick the best one, get_active_bin, deploy_position with ${config.management.deployAmountSol} SOL. Execute now, don't ask.`,
           config.llm.maxSteps,
           [],
           "SCREENER"
@@ -1475,31 +1487,27 @@ Commands:
           poolsToStudy = candidates.map((c) => ({ pool: c.pool, name: c.name }));
         }
 
+        // Limit to 5 pools max to avoid token limits and long-running studies
+        poolsToStudy = poolsToStudy.slice(0, 5);
         console.log(`\nStudying top LPers across ${poolsToStudy.length} pools...\n`);
         for (const p of poolsToStudy) console.log(`  • ${p.name || p.pool}`);
         console.log();
 
-        const poolList = poolsToStudy
-          .map((p, i) => `${i + 1}. ${p.name} (${p.pool})`)
-          .join("\n");
-
-        const { content: reply } = await agentLoop(
-          `Study top LPers across these ${poolsToStudy.length} pools by calling study_top_lpers for each:
-
-${poolList}
-
-For each pool, call study_top_lpers then move to the next. After studying all pools:
-1. Identify patterns that appear across multiple pools (hold time, scalping vs holding, win rates).
-2. Note pool-specific patterns where behaviour differs significantly.
-3. Derive 4-8 concrete, actionable lessons using add_lesson. Prioritize cross-pool patterns — they're more reliable.
-4. Summarize what you learned.
-
-Focus on: hold duration, entry/exit timing, what win rates look like, whether scalpers or holders dominate.`,
-          config.llm.maxSteps,
-          [],
-          "GENERAL"
-        );
-        console.log(`\n${reply}\n`);
+        for (const p of poolsToStudy) {
+          try {
+            const { content: reply } = await agentLoop(
+              `Study top LPers for pool ${p.name} (${p.pool}) by calling study_top_lpers.
+After studying, derive 2-3 concrete, actionable lessons using add_lesson.
+Summarize what you learned briefly.`,
+              config.llm.maxSteps,
+              [],
+              "GENERAL"
+            );
+            console.log(`\n${reply}\n`);
+          } catch (e) {
+            log("learn_warn", `Study failed for ${p.name}: ${e.message}`);
+          }
+        }
       });
       return;
     }
@@ -1549,8 +1557,8 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
   (async () => {
     try {
       const startupStep3 = process.env.DRY_RUN === "true"
-        ? `3. Ignore wallet SOL threshold in dry run: get_top_candidates then simulate deploy ${DEPLOY} SOL.`
-        : `3. If SOL >= ${config.management.minSolToOpen}: get_top_candidates then deploy ${DEPLOY} SOL.`;
+        ? `3. Ignore wallet SOL threshold in dry run: get_top_candidates then simulate deploy ${config.management.deployAmountSol} SOL.`
+        : `3. If SOL >= ${config.management.minSolToOpen}: get_top_candidates then deploy ${config.management.deployAmountSol} SOL.`;
       await agentLoop(`
 STARTUP CHECK
 1. get_wallet_balance. 2. get_my_positions. ${startupStep3} 4. Report.

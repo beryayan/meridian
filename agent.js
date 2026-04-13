@@ -26,6 +26,9 @@ const GENERAL_INTENT_ONLY_TOOLS = new Set([
   "set_active_strategy",
 ]);
 
+// Tools that must execute sequentially — concurrent execution causes race conditions
+const SEQUENTIAL_TOOLS = new Set(["close_position", "deploy_position", "claim_fees", "swap_token"]);
+
 // Intent → tool subsets for GENERAL role
 const INTENT_TOOLS = {
   deploy:      new Set(["deploy_position", "get_top_candidates", "get_active_bin", "get_pool_memory", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_wallet_balance", "get_my_positions", "add_pool_note"]),
@@ -109,6 +112,75 @@ function shouldRequireRealToolUse(goal, agentType, interactive = false) {
   return interactive && LIVE_DATA_TOOL_INTENTS.test(goal);
 }
 
+async function executeSingleTool(toolCall, firedOnce, onToolStart, onToolFinish, step, ONCE_PER_SESSION, NO_RETRY_TOOLS) {
+  let functionName = toolCall.function.name.trim();
+  // Strip malformed XML-like suffixes only — e.g. "tool<foo>" → "tool"
+  // Only removes balanced <...> pairs at the end, not literal < in valid names
+  if (/<[^>]*>$/.test(functionName)) {
+    functionName = functionName.replace(/<[^>]*>$/, "").trim();
+  }
+  let functionArgs;
+
+  try {
+    functionArgs = JSON.parse(toolCall.function.arguments);
+  } catch {
+    try {
+      functionArgs = JSON.parse(jsonrepair(toolCall.function.arguments));
+      log("warn", `Repaired malformed JSON args for ${functionName}`);
+    } catch (parseError) {
+      log("error", `Failed to parse args for ${functionName}: ${parseError.message}`);
+      functionArgs = {};
+    }
+  }
+
+  // Block once-per-session tools from firing a second time
+  if (ONCE_PER_SESSION.has(functionName) && firedOnce.has(functionName)) {
+    log("agent", `Blocked duplicate ${functionName} call — already executed this session`);
+    await onToolFinish?.({
+      name: functionName,
+      args: functionArgs,
+      result: { blocked: true, reason: `${functionName} already attempted this session — do not retry. If it failed, report the error and stop.` },
+      success: false,
+      step,
+    });
+    return {
+      role: "tool",
+      tool_call_id: toolCall.id,
+      content: JSON.stringify({ blocked: true, reason: `${functionName} already attempted this session — do not retry. If it failed, report the error and stop.` }),
+    };
+  }
+
+  await onToolStart?.({ name: functionName, args: functionArgs, step });
+  const result = await executeTool(functionName, functionArgs);
+  await onToolFinish?.({
+    name: functionName,
+    args: functionArgs,
+    result,
+    success: result?.success !== false && !result?.error && !result?.blocked,
+    step,
+  });
+
+  // Lock deploy_position after first attempt regardless of outcome — retrying is never right
+  // For close/swap: only lock on success so genuine failures can be retried
+  if (NO_RETRY_TOOLS.has(functionName)) firedOnce.add(functionName);
+  else if (ONCE_PER_SESSION.has(functionName) && result.success === true) firedOnce.add(functionName);
+
+  return {
+    role: "tool",
+    tool_call_id: toolCall.id,
+    content: JSON.stringify(result),
+  };
+}
+
+async function executeSequential(toolCalls, firedOnce, onToolStart, onToolFinish, step, ONCE_PER_SESSION, NO_RETRY_TOOLS) {
+  const results = [];
+  for (const toolCall of toolCalls) {
+    const result = await executeSingleTool(toolCall, firedOnce, onToolStart, onToolFinish, step, ONCE_PER_SESSION, NO_RETRY_TOOLS);
+    results.push(result);
+  }
+  return results;
+}
+
 function buildMessages(systemPrompt, sessionHistory, goal, providerMode = "system") {
   if (providerMode === "user_embedded") {
     return [
@@ -144,6 +216,8 @@ function isToolChoiceRequiredError(error) {
  * @param {number} maxSteps - Safety limit on iterations (default 20)
  * @returns {string} - The agent's final text response
  */
+
+
 export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHistory = [], agentType = "GENERAL", model = null, maxOutputTokens = null, options = {}) {
   const { interactive = false, onToolStart = null, onToolFinish = null } = options;
   // Build dynamic system prompt with current portfolio state
@@ -177,6 +251,14 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
   let emptyStreak = 0;
   for (let step = 0; step < maxSteps; step++) {
     log("agent", `Step ${step + 1}/${maxSteps}`);
+
+    // Trim message history to prevent context overflow — keep system prompt + latest messages
+    const MAX_HISTORY = 40;
+    if (messages.length > MAX_HISTORY + 1) {
+      const systemMsg = messages[0];
+      messages = [systemMsg, ...messages.slice(-(MAX_HISTORY))];
+      log("agent", `Trimmed message history to ${MAX_HISTORY} messages`);
+    }
 
     try {
       const activeModel = model || DEFAULT_MODEL;
@@ -260,11 +342,18 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       // If the model didn't call any tools, it's done
       if (!msg.tool_calls || msg.tool_calls.length === 0) {
         // Hermes sometimes returns null content — pop the empty message and retry once
-        if (!msg.content) {
-          messages.pop(); // remove the empty assistant message
-          log("agent", "Empty response, retrying...");
-          continue;
-        }
+      if (!msg.content) 
+      {
+        emptyStreak += 1;
+        messages.pop();
+        log("agent", `Empty response (streak ${emptyStreak}/3), retrying...`);
+          if (emptyStreak >= 3) 
+            {
+        return { content: "Model returned empty responses repeatedly. Check logs.", userMessage: goal };
+            }
+        continue;
+      }
+emptyStreak = 0; // reset saat ada content
         if (mustUseRealTool && !sawToolCall) {
           noToolRetryCount += 1;
           messages.pop();
@@ -280,6 +369,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
             content: providerMode === "system"
               ? "You have not used any tool yet. This request requires real tool execution or live tool-backed data. Do not answer from memory or inference. Call the appropriate tool first, then report only the real result."
               : "[SYSTEM REMINDER]\nYou have not used any tool yet. This request requires real tool execution or live tool-backed data. Do not answer from memory or inference. Call the appropriate tool first, then report only the real result.",
+            _isReminder: true,
           });
           continue;
         }
@@ -289,61 +379,22 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       }
       sawToolCall = true;
 
-      // Execute each tool call in parallel
-      const toolResults = await Promise.all(msg.tool_calls.map(async (toolCall) => {
-        const functionName = toolCall.function.name.replace(/<.*$/, "").trim();
-        let functionArgs;
+      // Remove any leftover system reminders from failed retries — they must not persist in history
+      const reminderIdx = messages.findLastIndex(m => m._isReminder);
+      if (reminderIdx !== -1) messages.splice(reminderIdx, 1);
 
-        try {
-          functionArgs = JSON.parse(toolCall.function.arguments);
-        } catch {
-          try {
-            functionArgs = JSON.parse(jsonrepair(toolCall.function.arguments));
-            log("warn", `Repaired malformed JSON args for ${functionName}`);
-          } catch (parseError) {
-            log("error", `Failed to parse args for ${functionName}: ${parseError.message}`);
-            functionArgs = {};
-          }
-        }
+      // Execute tools: sequential if any mutating tool is present, otherwise parallel
+      const hasMutating = msg.tool_calls.some(tc => {
+        let name = tc.function.name.trim();
+        if (/<[^>]*>$/.test(name)) name = name.replace(/<[^>]*>$/, "").trim();
+        return SEQUENTIAL_TOOLS.has(name);
+      });
 
-        // Block once-per-session tools from firing a second time
-        if (ONCE_PER_SESSION.has(functionName) && firedOnce.has(functionName)) {
-          log("agent", `Blocked duplicate ${functionName} call — already executed this session`);
-          await onToolFinish?.({
-            name: functionName,
-            args: functionArgs,
-            result: { blocked: true, reason: `${functionName} already attempted this session — do not retry. If it failed, report the error and stop.` },
-            success: false,
-            step,
-          });
-          return {
-            role: "tool",
-            tool_call_id: toolCall.id,
-            content: JSON.stringify({ blocked: true, reason: `${functionName} already attempted this session — do not retry. If it failed, report the error and stop.` }),
-          };
-        }
-
-        await onToolStart?.({ name: functionName, args: functionArgs, step });
-        const result = await executeTool(functionName, functionArgs);
-        await onToolFinish?.({
-          name: functionName,
-          args: functionArgs,
-          result,
-          success: result?.success !== false && !result?.error && !result?.blocked,
-          step,
-        });
-
-        // Lock deploy_position after first attempt regardless of outcome — retrying is never right
-        // For close/swap: only lock on success so genuine failures can be retried
-        if (NO_RETRY_TOOLS.has(functionName)) firedOnce.add(functionName);
-        else if (ONCE_PER_SESSION.has(functionName) && result.success === true) firedOnce.add(functionName);
-
-        return {
-          role: "tool",
-          tool_call_id: toolCall.id,
-          content: JSON.stringify(result),
-        };
-      }));
+      const toolResults = hasMutating
+        ? await executeSequential(msg.tool_calls, firedOnce, onToolStart, onToolFinish, step, ONCE_PER_SESSION, NO_RETRY_TOOLS)
+        : await Promise.all(msg.tool_calls.map(async (toolCall) =>
+            executeSingleTool(toolCall, firedOnce, onToolStart, onToolFinish, step, ONCE_PER_SESSION, NO_RETRY_TOOLS)
+          ));
 
       messages.push(...toolResults);
     } catch (error) {
@@ -353,6 +404,13 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       if (error.status === 429) {
         log("agent", "Rate limited, waiting 30s...");
         await sleep(30000);
+        continue;
+      }
+
+      // Retry on transient provider errors
+      if (error.status === 502 || error.status === 503) {
+        log("agent", `Transient error ${error.status}, waiting 10s...`);
+        await sleep(10000);
         continue;
       }
 
