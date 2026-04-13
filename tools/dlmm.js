@@ -2,6 +2,8 @@ import {
   Connection,
   Keypair,
   PublicKey,
+  Transaction,
+  VersionedTransaction,
   sendAndConfirmTransaction,
 } from "@solana/web3.js";
 import BN from "bn.js";
@@ -65,6 +67,78 @@ function getWallet() {
     log("init", `Wallet: ${_wallet.publicKey.toString()}`);
   }
   return _wallet;
+}
+
+function getMeridianApiBase() {
+  return String(config.api.url || "https://api.agentmeridian.xyz/api").replace(/\/+$/, "");
+}
+
+function getMeridianHeaders() {
+  const headers = { "Content-Type": "application/json" };
+  if (config.api.publicApiKey) {
+    headers["x-api-key"] = config.api.publicApiKey;
+  }
+  return headers;
+}
+
+function shouldUseLpAgentRelay() {
+  return !!config.api.lpAgentRelayEnabled;
+}
+
+function shouldUseLpAgentRelayForDeploy() {
+  return false;
+}
+
+async function meridianJson(pathname, options = {}) {
+  const res = await fetch(`${getMeridianApiBase()}${pathname}`, options);
+  const text = await res.text().catch(() => "");
+  let payload = {};
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch {
+    payload = { raw: text };
+  }
+  if (!res.ok) {
+    throw new Error(payload?.error || `${pathname} ${res.status}`);
+  }
+  return payload;
+}
+
+function signSerializedTransaction(serialized, wallet) {
+  const bytes = Buffer.from(serialized, "base64");
+  try {
+    const versioned = VersionedTransaction.deserialize(bytes);
+    versioned.sign([wallet]);
+    return Buffer.from(versioned.serialize()).toString("base64");
+  } catch {
+    const legacy = Transaction.from(bytes);
+    legacy.partialSign(wallet);
+    return legacy
+      .serialize({ requireAllSignatures: false, verifySignatures: false })
+      .toString("base64");
+  }
+}
+
+function signSerializedTransactions(serializedTxs, wallet) {
+  return (serializedTxs || [])
+    .filter((entry) => typeof entry === "string" && entry.length > 0)
+    .map((entry) => signSerializedTransaction(entry, wallet));
+}
+
+function normalizeExecutionSignatures(result) {
+  const signatures = [];
+  const seen = new Set();
+  for (const value of []
+    .concat(result?.signatures || [])
+    .concat(result?.result?.txHashes || [])
+    .concat(result?.result?.signatures || [])
+    .concat(result?.result?.signature ? [result.result.signature] : [])) {
+    if (typeof value !== "string" || !value) continue;
+    if (seen.has(value)) continue;
+    seen.add(value);
+    signatures.push(value);
+  }
+  return signatures;
 }
 
 // ─── Pool Cache ────────────────────────────────────────────────
@@ -527,6 +601,16 @@ function deriveLpAgentPnlPct(lpData, solMode = false) {
   const unclaimedFees = solMode ? safeNum(lpData.unCollectedFeeNative) : safeNum(lpData.unCollectedFee);
   const pnl = currentValue + unclaimedFees - deposit;
   return (pnl / deposit) * 100;
+}
+
+async function fetchOpenPositionsFromMeridian({ walletAddress, agentId }) {
+  const search = new URLSearchParams({
+    owner: walletAddress,
+    agentId: agentId || "agent-local",
+  });
+  return meridianJson(`/positions/open?${search.toString()}`, {
+    headers: config.api.publicApiKey ? { "x-api-key": config.api.publicApiKey } : {},
+  });
 }
 
 // ─── Get My Positions ──────────────────────────────────────────
