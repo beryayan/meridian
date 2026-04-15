@@ -1027,11 +1027,19 @@ export async function closePosition({ position_address, reason }) {
 
     recordClose(position_address, reason || "agent decision");
 
+    // Hoist defaults — used both inside and outside the `if (tracked)` block
+    let minutesHeld = 0;
+    let minutesOOR = 0;
+    let pnlUsd = 0;
+    let pnlPct = 0;
+    let finalValueUsd = 0;
+    let initialUsd = 0;
+    let feesUsd = tracked?.total_fees_claimed_usd || 0;
+
     if (tracked) {
       const deployedAt = new Date(tracked.deployed_at).getTime();
-      const minutesHeld = Math.floor((Date.now() - deployedAt) / 60000);
+      minutesHeld = Math.floor((Date.now() - deployedAt) / 60000);
 
-      let minutesOOR = 0;
       if (tracked.out_of_range_since) {
         minutesOOR = Math.floor((Date.now() - new Date(tracked.out_of_range_since).getTime()) / 60000);
       }
@@ -1043,15 +1051,9 @@ export async function closePosition({ position_address, reason }) {
         return !stopLossTriggered && pct <= -90;
       };
 
-      // FIX #7: Extended retry — 9 attempts × 10s = 90s total for Meteora to settle
-      let pnlUsd = 0;
-      let pnlPct = 0;
-      let finalValueUsd = 0;
-      let initialUsd = 0;
-      let feesUsd = tracked.total_fees_claimed_usd || 0;
       try {
         const closedUrl = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${wallet.publicKey.toString()}&status=closed&pageSize=50&page=1`;
-        for (let attempt = 0; attempt < 9; attempt++) { // FIX #7: was 6
+        for (let attempt = 0; attempt < 9; attempt++) {
           const res = await fetch(closedUrl);
           if (res.ok) {
             const data = await res.json();
@@ -1078,7 +1080,7 @@ export async function closePosition({ position_address, reason }) {
               log("close_warn", `Position not found in status=closed response (attempt ${attempt + 1}/9) — may still be settling`);
             }
           }
-          if (attempt < 8) await new Promise((r) => setTimeout(r, 10000)); // FIX #7: was 5000ms
+          if (attempt < 8) await new Promise((r) => setTimeout(r, 10000));
         }
       } catch (e) {
         log("close_warn", `Closed PnL fetch failed: ${e.message}`);
@@ -1090,10 +1092,10 @@ export async function closePosition({ position_address, reason }) {
           pnlUsd        = cachedPos.pnl_true_usd ?? cachedPos.pnl_usd ?? 0;
           pnlPct        = cachedPos.pnl_pct   ?? 0;
           feesUsd       = (cachedPos.collected_fees_true_usd || 0) + (cachedPos.unclaimed_fees_true_usd || 0);
-          initialUsd    = tracked.initial_value_usd || 0;
+          initialUsd    = tracked?.initial_value_usd || 0;
           if (initialUsd > 0) {
             finalValueUsd = Math.max(0, initialUsd + pnlUsd - feesUsd);
-            pnlPct = initialUsd > 0 ? (pnlUsd / initialUsd) * 100 : 0;
+            pnlPct = (pnlUsd / initialUsd) * 100;
             if (!Number.isFinite(pnlPct)) pnlPct = 0;
           } else {
             finalValueUsd = cachedPos.total_value_true_usd ?? cachedPos.total_value_usd ?? 0;
@@ -1106,15 +1108,15 @@ export async function closePosition({ position_address, reason }) {
       await recordPerformance({
         position: position_address,
         pool: poolAddress,
-        pool_name: tracked.pool_name || poolMeta.name || poolAddress.slice(0, 8),
+        pool_name: tracked?.pool_name || poolMeta.name || poolAddress.slice(0, 8),
         base_mint: pool.lbPair.tokenXMint.toString(),
-        strategy: tracked.strategy,
-        bin_range: tracked.bin_range,
-        bin_step: tracked.bin_step || null,
-        volatility: tracked.volatility || null,
-        fee_tvl_ratio: tracked.fee_tvl_ratio || null,
-        organic_score: tracked.organic_score || null,
-        amount_sol: tracked.amount_sol,
+        strategy: tracked?.strategy,
+        bin_range: tracked?.bin_range,
+        bin_step: tracked?.bin_step || null,
+        volatility: tracked?.volatility || null,
+        fee_tvl_ratio: tracked?.fee_tvl_ratio || null,
+        organic_score: tracked?.organic_score || null,
+        amount_sol: tracked?.amount_sol,
         fees_earned_usd: feesUsd,
         final_value_usd: finalValueUsd,
         initial_value_usd: initialUsd,
@@ -1127,13 +1129,13 @@ export async function closePosition({ position_address, reason }) {
         type: "close",
         actor: "MANAGER",
         pool: poolAddress,
-        pool_name: tracked.pool_name || poolMeta.name || poolAddress.slice(0, 8),
+        pool_name: tracked?.pool_name || poolMeta.name || poolAddress.slice(0, 8),
         position: position_address,
         summary: `Closed at ${pnlPct.toFixed(2)}%`,
         reason: reason || "agent decision",
         risks: [
           minutesOOR > 0 ? `out of range ${minutesOOR}m` : null,
-          tracked.volatility != null ? `volatility ${tracked.volatility}` : null,
+          tracked?.volatility != null ? `volatility ${tracked.volatility}` : null,
         ].filter(Boolean),
         metrics: {
           pnl_usd: pnlUsd,
@@ -1142,48 +1144,37 @@ export async function closePosition({ position_address, reason }) {
           minutes_held: minutesHeld,
         },
       });
-
-      return {
-        success: true,
-        position: position_address,
-        pool: poolAddress,
-        pool_name: tracked.pool_name || poolMeta.name || null,
-        claim_txs: claimTxHashes,
-        close_txs: closeTxHashes,
-        txs: txHashes,
-        pnl_usd: pnlUsd,
-        pnl_pct: pnlPct,
-        base_mint: pool.lbPair.tokenXMint.toString(),
-        fees_earned_usd: feesUsd,
-        minutes_held: minutesHeld,
-        minutes_in_range: minutesHeld - minutesOOR,
-        initial_value_usd: initialUsd,
-        final_value_usd: finalValueUsd,
-        amount_sol: tracked.amount_sol || null,
-        close_reason: reason || "agent decision",
-      };
     }
 
     appendDecision({
       type: "close",
       actor: "MANAGER",
       pool: poolAddress,
-      pool_name: poolMeta.name || poolAddress.slice(0, 8),
+      pool_name: tracked?.pool_name || poolMeta.name || poolAddress.slice(0, 8),
       position: position_address,
-      summary: "Closed position",
+      summary: `Closed at ${pnlPct.toFixed(2)}%`,
       reason: reason || "agent decision",
-      metrics: {},
+      metrics: { pnl_usd: pnlUsd, pnl_pct: pnlPct, fees_usd: feesUsd, minutes_held: minutesHeld },
     });
 
     return {
       success: true,
       position: position_address,
       pool: poolAddress,
-      pool_name: poolMeta.name || null,
+      pool_name: tracked?.pool_name || poolMeta.name || null,
       claim_txs: claimTxHashes,
       close_txs: closeTxHashes,
       txs: txHashes,
+      pnl_usd: pnlUsd,
+      pnl_pct: pnlPct,
       base_mint: pool.lbPair.tokenXMint.toString(),
+      fees_earned_usd: feesUsd,
+      minutes_held: minutesHeld,
+      minutes_in_range: minutesHeld - minutesOOR,
+      initial_value_usd: initialUsd,
+      final_value_usd: finalValueUsd,
+      amount_sol: tracked?.amount_sol || null,
+      close_reason: reason || "agent decision",
     };
   } catch (error) {
     log("close_error", error.message);
