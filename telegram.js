@@ -18,6 +18,7 @@ const ALLOWED_USER_IDS = new Set(
 let chatId   = process.env.TELEGRAM_CHAT_ID || null;
 let _offset  = 0;
 let _polling = false;
+let _pollInProgress = false;
 let _lastPollAt = Date.now();
 let _liveMessageDepth = 0;
 let _warnedMissingChatId = false;
@@ -342,6 +343,11 @@ export async function createLiveMessage(title, intro = "Starting...") {
 // ─── Long polling ────────────────────────────────────────────────
 async function poll(onMessage) {
   while (_polling) {
+    if (_pollInProgress) {
+      await sleep(1000);
+      continue;
+    }
+    _pollInProgress = true;
     try {
       const res = await fetch(
         `${BASE}/getUpdates?offset=${_offset}&timeout=30`,
@@ -350,18 +356,24 @@ async function poll(onMessage) {
       if (!res.ok) { await sleep(5000); continue; }
       const data = await res.json();
       _lastPollAt = Date.now();
-      for (const update of data.result || []) {
+
+      // Collect updates first, then process them — offset only advances after all are handled
+      const toProcess = (data.result || []).filter(
+        (update) => update.message?.text && isAuthorizedIncomingMessage(update.message)
+      );
+      for (const update of toProcess) {
         _offset = update.update_id + 1;
-        const msg = update.message;
-        if (!msg?.text) continue;
-        if (!isAuthorizedIncomingMessage(msg)) continue;
-        await onMessage(msg);
+      }
+      for (const update of toProcess) {
+        await onMessage(update.message);
       }
     } catch (e) {
       if (!e.message?.includes("aborted")) {
         log("telegram_error", `Poll error: ${e.message}`);
       }
       await sleep(5000);
+    } finally {
+      _pollInProgress = false;
     }
   }
 }
@@ -372,6 +384,7 @@ export function startPolling(onMessage) {
   poll(onMessage); // fire-and-forget
   const pollWatchdog = setInterval(() => {
     if (!_polling) { clearInterval(pollWatchdog); return; }
+    if (_pollInProgress) return;
     if (Date.now() - _lastPollAt > 60_000) {
       log("telegram_warn", "Poll watchdog: no updates in 60s — restarting poll");
       _lastPollAt = Date.now();
